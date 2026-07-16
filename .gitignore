@@ -1,0 +1,18 @@
+# Build artifacts
+.build/
+*.o
+
+# macOS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Xcode (if ever used)
+*.xcworkspace
+*.xcuserdata
+DerivedData/
+
+# IDE
+.idea/
+.vscode/
