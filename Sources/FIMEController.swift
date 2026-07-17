@@ -34,6 +34,13 @@ final class FIMEController: IMKInputController {
     private var selectedIndex = 0
     private let panel: FIMEPanel
 
+    /// FIME 是否是当前活跃的输入法
+    ///
+    /// 由 activateServer / deactivateServer 维护。
+    /// 即使 FIME 进程还在运行，只要用户切到别的输入法，此值为 false。
+    /// 用于阻止轮询定时器在非活跃状态下触发模式切换和视觉提示。
+    private var isActive = false
+
     /// 当前模式，默认为 raw
     private var mode: InputMode = .raw {
         didSet { log("mode: \(mode.rawValue)") }
@@ -80,9 +87,9 @@ final class FIMEController: IMKInputController {
             // Shift 被按下
             shiftDownAt = CACurrentMediaTime()
         } else if !currentShift && lastPollShift, shiftDownAt > 0 {
-            // Shift 被释放 — 检查是否短按切换
+            // Shift 被释放 — 仅在 FIME 活跃时检查是否短按切换
             let elapsed = CACurrentMediaTime() - shiftDownAt
-            if client() != nil && elapsed >= 0.03 && elapsed <= 0.5 {
+            if isActive && elapsed >= 0.03 && elapsed <= 0.5 {
                 toggleMode()
             }
             shiftDownAt = 0
@@ -93,11 +100,13 @@ final class FIMEController: IMKInputController {
 
     override func activateServer(_ sender: Any!) {
         super.activateServer(sender)
+        isActive = true
         log("activateServer")
     }
 
     override func deactivateServer(_ sender: Any!) {
         super.deactivateServer(sender)
+        isActive = false
         currentInput = ""
         selectedIndex = 0
         panel.dismiss()
