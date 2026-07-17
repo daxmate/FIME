@@ -73,6 +73,70 @@ final class FIMEPanel: NSPanel {
 
     // MARK: - 公开方法
 
+    /// 显示短暂的模式切换提示
+    ///
+    /// 当用户通过 Shift 切换输入模式时，在光标附近短暂显示
+    /// 当前模式名称（如 `[FIME]` 或 `[ABC]`），800ms 后自动消失。
+    ///
+    /// - Parameters:
+    ///   - name: 模式名称（如 "FIME"、"ABC"）
+    ///   - rect: 光标在屏幕坐标下的矩形
+    func showModeIndicator(_ name: String, near rect: NSRect) {
+        // 创建临时提示视图
+        let toastLabel = NSTextField(labelWithString: "[\(name)]")
+        toastLabel.font = NSFont.boldSystemFont(ofSize: 15)
+        toastLabel.textColor = NSColor.white
+        toastLabel.alignment = .center
+        toastLabel.sizeToFit()
+
+        let pad: CGFloat = 12
+        let tw = toastLabel.frame.width + pad * 2
+        let th = toastLabel.frame.height + pad
+        let toastRect = NSRect(x: 0, y: 0, width: tw, height: th)
+
+        let toastView = NSView(frame: toastRect)
+        toastView.wantsLayer = true
+        toastView.layer?.cornerRadius = 6
+        toastView.layer?.masksToBounds = true
+        toastView.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+
+        toastLabel.frame.origin = NSPoint(x: pad, y: (th - toastLabel.frame.height) / 2)
+        toastView.addSubview(toastLabel)
+
+        // 计算位置
+        let panelW = tw
+        var x = rect.minX
+        var y = rect.minY - th - 2
+        if y < 0 { y = rect.maxY + 2 }
+        if let screen = NSScreen.main {
+            let sf = screen.visibleFrame
+            if x + panelW > sf.maxX { x = sf.maxX - panelW }
+            if y < sf.minY { y = sf.minY }
+        }
+
+        // 创建临时面板
+        let toastPanel = NSPanel(
+            contentRect: toastRect,
+            styleMask: [.nonactivatingPanel, .fullSizeContentView],
+            backing: .buffered, defer: true
+        )
+        toastPanel.level = .init(Int(CGShieldingWindowLevel()))
+        toastPanel.hasShadow = true
+        toastPanel.backgroundColor = .clear
+        toastPanel.isOpaque = false
+        toastPanel.titleVisibility = .hidden
+        toastPanel.titlebarAppearsTransparent = true
+        toastPanel.isMovable = false
+        toastPanel.contentView = toastView
+        toastPanel.setFrameOrigin(NSPoint(x: x, y: y))
+        toastPanel.orderFront(nil)
+
+        // 800ms 后自动关闭
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            toastPanel.orderOut(nil)
+        }
+    }
+
     /// 更新候选列表并刷新显示
     ///
     /// 根据候选词数量计算面板尺寸，设置内联视图的候选数据和点击回调。

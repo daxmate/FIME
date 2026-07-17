@@ -78,7 +78,7 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSPrincipalClass</key>
-	<string>NSApplication</string>
+	<string>FIMEApplication</string>
 	<key>TICapsLockLanguageSwitchCapable</key>
 	<true/>
 </dict>
