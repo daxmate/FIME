@@ -1,14 +1,42 @@
 import Cocoa
 import InputMethodKit
 
+// MARK: - 输入模式
+
+/// FIME 输入模式
+///
+/// - `raw`: 原始输出模式
+///   - 所有按键直接透传到当前应用，不做任何处理
+///   - 表现同系统默认英文输入法
+///   - 按 Shift 可在任意时刻切到 fuzzy 模式
+///
+/// - `fuzzy`: 模糊预测模式
+///   - 捕获字母输入进行子序列匹配
+///   - 显示候选词面板，支持导航和选择
+///   - 按 Shift 可切回 raw 模式
+enum InputMode: String {
+    /// 原始输出模式 — 透传所有按键，如同系统英文输入法
+    case raw = "ABC"
+    /// 模糊预测模式 — 捕获字母输入，显示候选词
+    case fuzzy = "FIME"
+}
+
 // MARK: - 输入法控制器
 
 /// FIME 输入法核心控制器
 ///
 /// `FIMEController` 继承自 `IMKInputController`，是 FIME 输入法的核心。
-/// 负责处理所有键盘事件、管理输入状态、控制候选窗显示。
+/// 支持两种模式：
+/// - **raw（原始输出）**：透传所有按键，行为同系统英文输入法
+/// - **fuzzy（模糊预测）**：捕获字母输入进行子序列匹配
 ///
-/// ## 按键映射
+/// ## 模式切换
+/// 按 **Shift**（左/右均可）切换模式。检测逻辑：
+/// 1. 记录 Shift 按下的时间戳
+/// 2. 如果下一个按键事件不带 Shift 修饰符 → Shift 已被释放 → 切换模式
+/// 3. 如果下一个按键事件带有 Shift 修饰符 → 用户是在输入大写字母，不切换
+///
+/// ## 按键映射（fuzzy 模式）
 /// | 按键 | 行为 |
 /// |------|------|
 /// | `a`–`z` | 输入字母，触发子序列匹配和候选更新 |
@@ -21,9 +49,9 @@ import InputMethodKit
 /// | `Escape` | 清空所有输入 |
 ///
 /// ## 设计说明
-/// - 不使用 `IMKCandidates` 框架（存在 `selectCandidate` 无法高亮其他候选的 bug）
-/// - 使用自定义 `FIMEPanel`（NSPanel）渲染候选列表，支持高亮和鼠标点击
-/// - 每次按键通过 `handle(_:client:)` 接收，返回 `true` 表示已消费该事件
+/// - 不使用 `IMKCandidates` 框架（`selectCandidateWithIdentifier:` 存在 bug）
+/// - 使用自定义 `FIMEPanel`（NSPanel）渲染候选列表
+/// - raw 模式下所有事件通过返回 `false` 透传，系统继续正常分发
 @objc(FIMEController)
 final class FIMEController: IMKInputController {
 
@@ -40,6 +68,25 @@ final class FIMEController: IMKInputController {
 
     /// 自定义候选窗面板
     private let panel: FIMEPanel
+
+    /// 当前输入模式，默认为 raw（原始输出）
+    private var mode: InputMode = .raw {
+        didSet {
+            log("mode: \(mode.rawValue)")
+        }
+    }
+
+    /// Shift 键按下的时间戳
+    ///
+    /// 用于判断 Shift 是作为修饰键（大写字母）还是作为模式切换。
+    /// 非零值表示 Shift 被按下但还未确定用途。
+    /// 收到下一个非-Shift 按键时根据修饰符状态决定是否切换。
+    private var shiftDownAt: TimeInterval = 0
+
+    /// 记录当前模式对应的 marked text 前缀，用于 inline 指示器
+    private var modeIndicator: String {
+        "[" + mode.rawValue + "]"
+    }
 
     // MARK: - 初始化与生命周期
 
@@ -70,10 +117,13 @@ final class FIMEController: IMKInputController {
 
     /// 输入法被停用（用户切换到其他输入法时调用）
     ///
-    /// 关闭候选窗以清理屏幕状态。
+    /// 关闭候选窗，清空输入状态以清理屏幕。
     /// - Parameter sender: 停用源（通常为 nil）
     override func deactivateServer(_ sender: Any!) {
         super.deactivateServer(sender)
+        currentInput = ""
+        selectedIndex = 0
+        shiftDownAt = 0
         panel.dismiss()
         log("deactivateServer")
     }
@@ -82,18 +132,15 @@ final class FIMEController: IMKInputController {
 
     /// 处理键盘按下事件
     ///
-    /// 这是输入法的核心方法，所有按键事件都先经过这里。
-    /// 返回 `true` 表示事件已被消费，`false` 表示让系统或应用处理。
-    ///
-    /// 事件处理流程：
-    /// 1. 先按 keyCode 检查特殊键（Backspace、方向键、Escape 等）
-    /// 2. 再按 characters 检查字符键（字母、空格、数字）
-    /// 3. 最后 fallthrough 到 `default: return false`
+    /// 这是输入法的核心方法。处理流程：
+    /// 1. 检测 Shift 键按下，记录时间戳（用于后续判断是否切换模式）
+    /// 2. 检查 Shift 释放后的模式切换条件
+    /// 3. 根据当前模式分派到 `handleRawMode` 或 `handleFuzzyMode`
     ///
     /// - Parameters:
     ///   - event: 键盘事件
     ///   - sender: 文本输入客户端（遵从 `IMKTextInput` 协议）
-    /// - Returns: `true` 表示事件已消费，`false` 表示未处理
+    /// - Returns: `true` 表示事件已消费，`false` 表示未处理（让系统继续分发）
     override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
         guard event.type == .keyDown else { return false }
         guard let clt = sender as? any IMKTextInput else {
@@ -101,8 +148,84 @@ final class FIMEController: IMKInputController {
             return false
         }
 
+        // ── 第一步：检测 Shift 键按下 ────────────────────────
+        // keyCode 56 = 左 Shift, 60 = 右 Shift
+        // 记录时间但不消费事件（return false），让 Shift 修饰符状态正确传递给应用
+        if event.keyCode == 56 || event.keyCode == 60 {
+            shiftDownAt = event.timestamp
+            return false
+        }
+
+        // ── 第二步：检查是否需要切换模式 ──────────────────────
+        // 如果 Shift 刚被按下过（shiftDownAt > 0），说明刚才的 Shift 事件已经传递给了应用。
+        // 现在收到了一个非 Shift 的按键，可以判断 Shift 的用途：
+        if shiftDownAt > 0 {
+            let gap = event.timestamp - shiftDownAt
+            if event.modifierFlags.contains(.shift) {
+                // Shift 仍然被按住 → 用户是在用 Shift 输入大写字母
+                // 不是模式切换，清除标记即可
+                shiftDownAt = 0
+            } else if gap > 0.05 {
+                // Shift 已被释放（当前按键没有 Shift 修饰符）
+                // 且到 Shift 按下至少过了 50ms（防抖）
+                // → 用户是单独按了 Shift（快速按下+释放）→ 切换模式！
+                log("Shift toggle after \(gap * 1000)ms gap")
+                toggleMode()
+                shiftDownAt = 0
+                // Shift 事件已透传，但切换模式后，当前按键需要按新模式处理
+                // 继续往下走，不要 return
+            } else {
+                // 间隙太短，可能是按键抖动，忽略切换
+                shiftDownAt = 0
+            }
+        }
+
+        // ── 第三步：按当前模式分派 ──────────────────────────
+        switch mode {
+        case .raw:
+            return handleRawMode(event: event, clt: clt)
+        case .fuzzy:
+            return handleFuzzyMode(event: event, clt: clt)
+        }
+    }
+
+    // MARK: - Raw Mode
+
+    /// 处理原始输出模式下的按键事件
+    ///
+    /// 在 raw 模式下，FIME 不拦截任何按键，所有事件透传给应用。
+    /// 唯一返回 `true` 的情况是当 fuzzy 模式有未提交的输入时，
+    /// 需要先清空（通过 `commitComposition` 提交）再切换。
+    ///
+    /// - Parameters:
+    ///   - event: 键盘事件
+    ///   - clt: 文本输入客户端
+    /// - Returns: 始终返回 `false`，让事件继续传递给应用
+    private func handleRawMode(event: NSEvent, clt: any IMKTextInput) -> Bool {
+        // 安全网：如果 fuzzy 模式留下了未提交的输入，强制提交
+        if !currentInput.isEmpty {
+            clt.insertText(currentInput, replacementRange: NSRange(location: NSNotFound, length: 0))
+            currentInput = ""
+            selectedIndex = 0
+            panel.dismiss()
+        }
+        // 所有按键透传
+        return false
+    }
+
+    // MARK: - Fuzzy Mode
+
+    /// 处理模糊预测模式下的按键事件
+    ///
+    /// 捕获字母输入，使用子序列匹配算法从词库中查找候选词，
+    /// 显示候选窗供用户选择。
+    ///
+    /// - Parameters:
+    ///   - event: 键盘事件
+    ///   - clt: 文本输入客户端
+    /// - Returns: `true` 表示事件已消费
+    private func handleFuzzyMode(event: NSEvent, clt: any IMKTextInput) -> Bool {
         // ── Backspace ──────────────────────────────────────────
-        // 删除上一个输入的字符。如果 currentInput 变空则隐藏候选窗。
         if event.keyCode == 51 {
             guard !currentInput.isEmpty else { return false }
             currentInput.removeLast()
@@ -120,8 +243,6 @@ final class FIMEController: IMKInputController {
         }
 
         // ── 方向键：↑ ↓ ← → ─────────────────────────────────
-        // 在候选列表中移动选中高亮。
-        // ↓ 和 → 为下一个，↑ 和 ← 为上一个，边界保护。
         if [123, 124, 125, 126].contains(event.keyCode) {
             guard !currentInput.isEmpty else { return false }
             let cands = engine.candidates(for: currentInput)
@@ -143,7 +264,7 @@ final class FIMEController: IMKInputController {
         if let chars = event.characters, let firstChar = chars.first {
             log("handle: char='\(firstChar)' kc=\(event.keyCode)")
 
-            // 字母输入：追加到 currentInput，更新候选和 inline 预览
+            // 字母输入：追加到 currentInput
             if firstChar.isLetter {
                 currentInput.append(firstChar)
                 selectedIndex = 0
@@ -153,7 +274,7 @@ final class FIMEController: IMKInputController {
                 return true
             }
 
-            // Space：如果有候选则提交选中候选 + 空格，否则插入空格
+            // Space：提交选中候选 + 空格
             if firstChar == " " {
                 if !currentInput.isEmpty {
                     return commitSelected(clt: clt, space: true)
@@ -164,16 +285,16 @@ final class FIMEController: IMKInputController {
                 return true
             }
 
-            // 1–8：直接选中并提交第 N 个候选（无需先导航再确认）
+            // 1–8：直接选中并提交第 N 个候选
             if firstChar >= "1" && firstChar <= "8" {
                 guard !currentInput.isEmpty else { return false }
                 return commitNth(Int(String(firstChar))! - 1, clt: clt)
             }
         }
 
-        // ── 特殊功能键（keyCode 匹配） ─────────────────────────
+        // ── 特殊功能键 ─────────────────────────────────────────
         switch event.keyCode {
-        case 53: // Escape — 清空所有输入，隐藏候选窗
+        case 53: // Escape — 清空所有输入
             guard !currentInput.isEmpty else { return false }
             clt.setMarkedText("", selectionRange: NSRange(location: 0, length: 0),
                               replacementRange: NSRange(location: NSNotFound, length: 0))
@@ -183,7 +304,7 @@ final class FIMEController: IMKInputController {
             log("clear on esc")
             return true
 
-        case 36: // Return — 输出原始输入文本（不选候选，即不接受预测）
+        case 36: // Return — 输出原文
             guard !currentInput.isEmpty else { return false }
             clt.insertText(currentInput, replacementRange: NSRange(location: NSNotFound, length: 0))
             log("commitRaw: '\(currentInput)'")
@@ -192,7 +313,7 @@ final class FIMEController: IMKInputController {
             panel.dismiss()
             return true
 
-        case 48: // Tab — 向下循环候选（到底回到第一个）
+        case 48: // Tab — 向下循环候选
             guard !currentInput.isEmpty else { return false }
             let cands = engine.candidates(for: currentInput)
             guard !cands.isEmpty else { return false }
@@ -207,10 +328,29 @@ final class FIMEController: IMKInputController {
         }
     }
 
+    // MARK: - 模式切换
+
+    /// 切换输入模式（raw ↔ fuzzy）
+    ///
+    /// 切换时自动清理未提交的输入，隐藏候选窗，
+    /// 并通过 marked text 显示模式指示器。
+    private func toggleMode() {
+        // 清理当前状态
+        if !currentInput.isEmpty, let clt = client() {
+            clt.insertText(currentInput, replacementRange: NSRange(location: NSNotFound, length: 0))
+        }
+        currentInput = ""
+        selectedIndex = 0
+        panel.dismiss()
+
+        // 切换模式
+        mode = mode == .raw ? .fuzzy : .raw
+    }
+
     /// IMK 框架的 fallback 输入方法
     ///
     /// 当 `handle(_:client:)` 返回 `false` 且系统确定该事件为文本输入时调用。
-    /// 一般不会触发，留作安全网。
+    /// 仅在 raw 模式下可能触发，留作安全网。
     ///
     /// - Parameters:
     ///   - string: 输入的文本
@@ -218,7 +358,7 @@ final class FIMEController: IMKInputController {
     /// - Returns: `true` 表示已处理
     override func inputText(_ string: String!, client sender: Any!) -> Bool {
         log("inputText fallback: '\(string ?? "nil")'")
-        guard let clt = sender as? any IMKTextInput, let string = string else { return false }
+        guard mode == .fuzzy, let clt = sender as? any IMKTextInput, let string = string else { return false }
         for char in string {
             if char.isLetter {
                 currentInput.append(char)
@@ -310,19 +450,19 @@ final class FIMEController: IMKInputController {
 
     /// 更新 inline 预览文本
     ///
-    /// 在文本光标处显示 `输入词 ▸ 选中候选` 格式的暂未提交文本，
-    /// 让用户在不看候选窗的情况下也能知道当前选中了哪个候选。
+    /// 在文本光标处显示带模式指示器的暂未提交文本：
+    /// `[FIME] 输入词 ▸ 选中候选`
     ///
-    /// 示例：输入 "pls"，选中第一个候选时显示 `pls ▸ please`
+    /// 如果当前没有候选，只显示 `[FIME] 输入词`。
     ///
     /// - Parameter clt: 文本输入客户端
     private func updateMarkedText(clt: any IMKTextInput) {
         let cands = engine.candidates(for: currentInput)
         let display: String
         if let word = cands[safe: selectedIndex] {
-            display = "\(currentInput) ▸ \(word)"
+            display = "\(modeIndicator) \(currentInput) ▸ \(word)"
         } else {
-            display = currentInput
+            display = "\(modeIndicator) \(currentInput)"
         }
         clt.setMarkedText(display,
             selectionRange: NSRange(location: currentInput.count, length: 0),
