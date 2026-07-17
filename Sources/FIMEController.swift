@@ -31,10 +31,12 @@ enum InputMode: String {
 /// - **fuzzy（模糊预测）**：捕获字母输入进行子序列匹配
 ///
 /// ## 模式切换
-/// 按 **Shift**（左/右均可）切换模式。检测逻辑：
-/// 1. 记录 Shift 按下的时间戳
-/// 2. 如果下一个按键事件不带 Shift 修饰符 → Shift 已被释放 → 切换模式
-/// 3. 如果下一个按键事件带有 Shift 修饰符 → 用户是在输入大写字母，不切换
+/// 快速按一次 **Shift**（左/右均可）切换模式。
+///
+/// 检测原理：通过 `NSEvent.addLocalMonitorForEvents(matching: .flagsChanged)`
+/// 监听 modifier 键事件，追踪 Shift 的按下和释放时序。
+/// 如果 Shift 在 30ms–500ms 内被按下+释放（期间没有其他按键），
+/// 则判定为模式切换动作。
 ///
 /// ## 按键映射（fuzzy 模式）
 /// | 按键 | 行为 |
@@ -52,6 +54,7 @@ enum InputMode: String {
 /// - 不使用 `IMKCandidates` 框架（`selectCandidateWithIdentifier:` 存在 bug）
 /// - 使用自定义 `FIMEPanel`（NSPanel）渲染候选列表
 /// - raw 模式下所有事件通过返回 `false` 透传，系统继续正常分发
+/// - Shift 检测通过 flagsChanged 事件监听器而非 `handle(_:client:)`
 @objc(FIMEController)
 final class FIMEController: IMKInputController {
 
@@ -76,23 +79,33 @@ final class FIMEController: IMKInputController {
         }
     }
 
-    /// Shift 键按下的时间戳
+    /// ⏱ Shift 键按下的时间点
     ///
-    /// 用于判断 Shift 是作为修饰键（大写字母）还是作为模式切换。
-    /// 非零值表示 Shift 被按下但还未确定用途。
-    /// 收到下一个非-Shift 按键时根据修饰符状态决定是否切换。
+    /// 由 flagsChanged 监听器在 Shift keyDown 时记录。
+    /// 在 Shift keyUp 时比较时间差，判断是「短按切换」还是「长按修饰」。
     private var shiftDownAt: TimeInterval = 0
+
+    /// 当前是否处于 Shift 按下状态
+    ///
+    /// 用于边缘检测：从 true→false 时触发 toggle 判定
+    private var shiftIsDown = false
+
+    /// flagsChanged 事件监听器
+    ///
+    /// `handle(_:client:)` 收不到 modifier 键事件，
+    /// 必须通过 NSEvent 的 local monitor 来监听 flagsChanged。
+    private var flagsMonitor: Any?
 
     /// 记录当前模式对应的 marked text 前缀，用于 inline 指示器
     private var modeIndicator: String {
-        "[" + mode.rawValue + "]"
+        "[\(mode.rawValue)]"
     }
 
     // MARK: - 初始化与生命周期
 
     /// 初始化输入法控制器
     ///
-    /// 创建 `WordDatabase` → `WordEngine` → `FIMEPanel` 的依赖链。
+    /// 创建依赖链并启动 flagsChanged 事件监听。
     ///
     /// - Parameters:
     ///   - server: IMK 服务器实例
@@ -103,7 +116,62 @@ final class FIMEController: IMKInputController {
         self.engine = WordEngine(database: db)
         self.panel = FIMEPanel()
         super.init(server: server, delegate: delegate, client: client)
+        setupFlagsMonitor()
         log("init OK")
+    }
+
+    /// 设置 flagsChanged 事件监听器
+    ///
+    /// modifier 键事件（Shift/Ctrl/Option/Command）不以 keyDown 形式
+    /// 到达 `handle(_:client:)`，需要通过 NSEvent 的 local monitor
+    /// 在当前进程的事件流中捕获 `.flagsChanged` 事件。
+    ///
+    /// 监听器只跟踪 Shift 的按下和释放状态，不影响事件传递。
+    private func setupFlagsMonitor() {
+        flagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) {
+            [weak self] event in
+            self?.handleFlagsChanged(event)
+            return event // ⚠️ 必须返回 event，否则 modifier 键会"卡住"
+        }
+        log("flagsMonitor: installed")
+    }
+
+    /// 处理 flagsChanged 事件（Shift 键按下/释放）
+    ///
+    /// 边缘检测 Shift 状态变化：
+    /// - `shiftIsDown` 从 false→true：记录按下时间
+    /// - `shiftIsDown` 从 true→false：如果按下的持续时间在 [30ms, 500ms]
+    ///   范围内，且 FIME 当前是活跃输入法（client() != nil），则切换模式。
+    ///
+    /// 长按 Shift（>500ms）视为修饰键操作（如大写输入），不触发切换。
+    ///
+    /// - Parameter event: flagsChanged 事件
+    private func handleFlagsChanged(_ event: NSEvent) {
+        let nowShiftIsDown = event.modifierFlags.contains(.shift)
+
+        if nowShiftIsDown && !shiftIsDown {
+            // Shift 被按下
+            shiftDownAt = CACurrentMediaTime()
+        } else if !nowShiftIsDown && shiftIsDown, shiftDownAt > 0 {
+            // Shift 被释放 — 检查是否是短按切换
+            guard client() != nil else {
+                // FIME 不是当前活跃输入法，忽略
+                shiftDownAt = 0
+                shiftIsDown = false
+                return
+            }
+            let elapsed = CACurrentMediaTime() - shiftDownAt
+            if elapsed >= 0.03 && elapsed <= 0.5 {
+                // 30ms ~ 500ms 内的快速按+放 → 模式切换
+                toggleMode()
+                log("shift toggle: \(Int(elapsed * 1000))ms")
+            } else {
+                log("shift ignored: \(Int(elapsed * 1000))ms (not a quick tap)")
+            }
+            shiftDownAt = 0
+        }
+
+        shiftIsDown = nowShiftIsDown
     }
 
     /// 输入法被激活（用户切换到 FIME 时调用）
@@ -133,9 +201,10 @@ final class FIMEController: IMKInputController {
     /// 处理键盘按下事件
     ///
     /// 这是输入法的核心方法。处理流程：
-    /// 1. 检测 Shift 键按下，记录时间戳（用于后续判断是否切换模式）
-    /// 2. 检查 Shift 释放后的模式切换条件
-    /// 3. 根据当前模式分派到 `handleRawMode` 或 `handleFuzzyMode`
+    /// 1. 根据当前模式分派到 `handleRawMode` 或 `handleFuzzyMode`
+    ///
+    /// 注意：modifier 键事件（Shift 等）不会到达此方法，
+    /// 它们在 `setupFlagsMonitor` 中单独处理。
     ///
     /// - Parameters:
     ///   - event: 键盘事件
@@ -148,39 +217,7 @@ final class FIMEController: IMKInputController {
             return false
         }
 
-        // ── 第一步：检测 Shift 键按下 ────────────────────────
-        // keyCode 56 = 左 Shift, 60 = 右 Shift
-        // 记录时间但不消费事件（return false），让 Shift 修饰符状态正确传递给应用
-        if event.keyCode == 56 || event.keyCode == 60 {
-            shiftDownAt = event.timestamp
-            return false
-        }
-
-        // ── 第二步：检查是否需要切换模式 ──────────────────────
-        // 如果 Shift 刚被按下过（shiftDownAt > 0），说明刚才的 Shift 事件已经传递给了应用。
-        // 现在收到了一个非 Shift 的按键，可以判断 Shift 的用途：
-        if shiftDownAt > 0 {
-            let gap = event.timestamp - shiftDownAt
-            if event.modifierFlags.contains(.shift) {
-                // Shift 仍然被按住 → 用户是在用 Shift 输入大写字母
-                // 不是模式切换，清除标记即可
-                shiftDownAt = 0
-            } else if gap > 0.05 {
-                // Shift 已被释放（当前按键没有 Shift 修饰符）
-                // 且到 Shift 按下至少过了 50ms（防抖）
-                // → 用户是单独按了 Shift（快速按下+释放）→ 切换模式！
-                log("Shift toggle after \(gap * 1000)ms gap")
-                toggleMode()
-                shiftDownAt = 0
-                // Shift 事件已透传，但切换模式后，当前按键需要按新模式处理
-                // 继续往下走，不要 return
-            } else {
-                // 间隙太短，可能是按键抖动，忽略切换
-                shiftDownAt = 0
-            }
-        }
-
-        // ── 第三步：按当前模式分派 ──────────────────────────
+        // 按当前模式分派
         switch mode {
         case .raw:
             return handleRawMode(event: event, clt: clt)
@@ -194,8 +231,6 @@ final class FIMEController: IMKInputController {
     /// 处理原始输出模式下的按键事件
     ///
     /// 在 raw 模式下，FIME 不拦截任何按键，所有事件透传给应用。
-    /// 唯一返回 `true` 的情况是当 fuzzy 模式有未提交的输入时，
-    /// 需要先清空（通过 `commitComposition` 提交）再切换。
     ///
     /// - Parameters:
     ///   - event: 键盘事件
@@ -266,7 +301,7 @@ final class FIMEController: IMKInputController {
 
             // 字母输入：追加到 currentInput
             if firstChar.isLetter {
-                currentInput.append(firstChar)
+                currentInput.append(firstChar.lowercased())
                 selectedIndex = 0
                 updateMarkedText(clt: clt)
                 log("setMarkedText='\(currentInput)'")
@@ -332,10 +367,9 @@ final class FIMEController: IMKInputController {
 
     /// 切换输入模式（raw ↔ fuzzy）
     ///
-    /// 切换时自动清理未提交的输入，隐藏候选窗，
-    /// 并通过 marked text 显示模式指示器。
+    /// 切换时自动提交未完成的输入、隐藏候选窗。
     private func toggleMode() {
-        // 清理当前状态
+        // 清理当前状态：提交未完成的输入
         if !currentInput.isEmpty, let clt = client() {
             clt.insertText(currentInput, replacementRange: NSRange(location: NSNotFound, length: 0))
         }
@@ -361,7 +395,7 @@ final class FIMEController: IMKInputController {
         guard mode == .fuzzy, let clt = sender as? any IMKTextInput, let string = string else { return false }
         for char in string {
             if char.isLetter {
-                currentInput.append(char)
+                currentInput.append(char.lowercased())
                 clt.setMarkedText(currentInput,
                     selectionRange: NSRange(location: currentInput.count, length: 0),
                     replacementRange: NSRange(location: NSNotFound, length: 0))
