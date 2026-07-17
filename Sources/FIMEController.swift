@@ -1,5 +1,6 @@
 import Cocoa
 import InputMethodKit
+import CoreGraphics
 
 // MARK: - 输入模式
 
@@ -33,10 +34,20 @@ enum InputMode: String {
 /// ## 模式切换
 /// 快速按一次 **Shift**（左/右均可）切换模式。
 ///
-/// 检测原理：通过 `NSEvent.addLocalMonitorForEvents(matching: .flagsChanged)`
-/// 监听 modifier 键事件，追踪 Shift 的按下和释放时序。
-/// 如果 Shift 在 30ms–500ms 内被按下+释放（期间没有其他按键），
-/// 则判定为模式切换动作。
+/// ### 原理解释
+/// macOS 输入法进程不走 NSApplication event loop，因此：
+/// - `handle(_:client:)` 收不到 modifier 键事件（它们是 flagsChanged 而非 keyDown）
+/// - `NSEvent.addLocalMonitorForEvents` 也无效
+///
+/// 解决方案使用 **CGEvent tap**（系统级事件钩子）：
+/// 1. 在 `CGEvent.tapCreate` 中注册 `.flagsChanged` 事件监听
+/// 2. 回调函数追踪 Shift 的按下/释放时序
+/// 3. 如果 Shift 在 30ms–500ms 内按下+释放 → 切换模式
+/// 4. 长按 Shift（>500ms）视为修饰键用途，不触发切换
+/// 5. 仅在 FIME 是活跃输入法时响应
+///
+/// CGEvent tap 需要**辅助功能权限**（System Settings → Privacy → Accessibility）。
+/// 首次运行时系统会自动弹出授权提示。
 ///
 /// ## 按键映射（fuzzy 模式）
 /// | 按键 | 行为 |
@@ -49,12 +60,6 @@ enum InputMode: String {
 /// | `Enter` | 输出原文（不选候选） |
 /// | `1`–`8` | 直接选中并提交第 N 个候选 |
 /// | `Escape` | 清空所有输入 |
-///
-/// ## 设计说明
-/// - 不使用 `IMKCandidates` 框架（`selectCandidateWithIdentifier:` 存在 bug）
-/// - 使用自定义 `FIMEPanel`（NSPanel）渲染候选列表
-/// - raw 模式下所有事件通过返回 `false` 透传，系统继续正常分发
-/// - Shift 检测通过 flagsChanged 事件监听器而非 `handle(_:client:)`
 @objc(FIMEController)
 final class FIMEController: IMKInputController {
 
@@ -81,7 +86,7 @@ final class FIMEController: IMKInputController {
 
     /// ⏱ Shift 键按下的时间点
     ///
-    /// 由 flagsChanged 监听器在 Shift keyDown 时记录。
+    /// 由 CGEvent tap 回调在 Shift keyDown 时记录。
     /// 在 Shift keyUp 时比较时间差，判断是「短按切换」还是「长按修饰」。
     private var shiftDownAt: TimeInterval = 0
 
@@ -90,11 +95,13 @@ final class FIMEController: IMKInputController {
     /// 用于边缘检测：从 true→false 时触发 toggle 判定
     private var shiftIsDown = false
 
-    /// flagsChanged 事件监听器
+    /// CGEvent tap 实例（系统级事件钩子）
     ///
-    /// `handle(_:client:)` 收不到 modifier 键事件，
-    /// 必须通过 NSEvent 的 local monitor 来监听 flagsChanged。
-    private var flagsMonitor: Any?
+    /// 用于捕获 flagsChanged 事件，检测 Shift 键的按下/释放。
+    private var eventTap: CFMachPort?
+
+    /// event tap 的 run loop source
+    private var runLoopSource: CFRunLoopSource?
 
     /// 记录当前模式对应的 marked text 前缀，用于 inline 指示器
     private var modeIndicator: String {
@@ -105,7 +112,7 @@ final class FIMEController: IMKInputController {
 
     /// 初始化输入法控制器
     ///
-    /// 创建依赖链并启动 flagsChanged 事件监听。
+    /// 创建依赖链并启动 CGEvent tap。
     ///
     /// - Parameters:
     ///   - server: IMK 服务器实例
@@ -116,24 +123,52 @@ final class FIMEController: IMKInputController {
         self.engine = WordEngine(database: db)
         self.panel = FIMEPanel()
         super.init(server: server, delegate: delegate, client: client)
-        setupFlagsMonitor()
-        log("init OK")
+        setupEventTap()
+        log("init OK, mode: \(mode.rawValue)")
     }
 
-    /// 设置 flagsChanged 事件监听器
+    /// 设置 CGEvent tap 监听 Shift 键事件
     ///
-    /// modifier 键事件（Shift/Ctrl/Option/Command）不以 keyDown 形式
-    /// 到达 `handle(_:client:)`，需要通过 NSEvent 的 local monitor
-    /// 在当前进程的事件流中捕获 `.flagsChanged` 事件。
+    /// 创建系统级事件钩子，仅监听 `.flagsChanged` 事件。
+    /// 事件经过 tap 后**原样放行**（`Unmanaged.passUnretained(event)`），
+    /// 不影响正常的按键处理流程。
     ///
-    /// 监听器只跟踪 Shift 的按下和释放状态，不影响事件传递。
-    private func setupFlagsMonitor() {
-        flagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) {
-            [weak self] event in
-            self?.handleFlagsChanged(event)
-            return event // ⚠️ 必须返回 event，否则 modifier 键会"卡住"
+    /// 如果 tap 创建失败（返回 nil），说明缺少辅助功能权限，
+    /// 用户需要在 System Settings → Privacy → Accessibility 中
+    /// 勾选 FIME。
+    private func setupEventTap() {
+        // 只监听 flagsChanged 事件
+        let eventMask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
+
+        // 使用 Unmanaged 将 self 传入 C 回调
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+
+        eventTap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: eventMask,
+            callback: { (proxy, type, event, refcon) -> Unmanaged<CGEvent>? in
+                guard type == .flagsChanged, let refcon = refcon else {
+                    return Unmanaged.passUnretained(event)
+                }
+                let controller = Unmanaged<FIMEController>.fromOpaque(refcon).takeUnretainedValue()
+                controller.handleFlagsChanged(event)
+                return Unmanaged.passUnretained(event) // 原样放行
+            },
+            userInfo: selfPtr
+        )
+
+        guard let tap = eventTap else {
+            log("eventTap: FAILED — 需要辅助功能权限 (System Settings → Privacy → Accessibility)")
+            return
         }
-        log("flagsMonitor: installed")
+
+        runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        if let rlSource = runLoopSource {
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), rlSource, .commonModes)
+            log("eventTap: installed")
+        }
     }
 
     /// 处理 flagsChanged 事件（Shift 键按下/释放）
@@ -145,28 +180,25 @@ final class FIMEController: IMKInputController {
     ///
     /// 长按 Shift（>500ms）视为修饰键操作（如大写输入），不触发切换。
     ///
-    /// - Parameter event: flagsChanged 事件
-    private func handleFlagsChanged(_ event: NSEvent) {
-        let nowShiftIsDown = event.modifierFlags.contains(.shift)
+    /// - Parameter event: CGEvent，通过 event.flags 读取修饰键状态
+    private func handleFlagsChanged(_ cgEvent: CGEvent) {
+        let flags = cgEvent.flags
+        let nowShiftIsDown = flags.contains(.maskShift)
 
         if nowShiftIsDown && !shiftIsDown {
             // Shift 被按下
             shiftDownAt = CACurrentMediaTime()
+            log("shift: down")
         } else if !nowShiftIsDown && shiftIsDown, shiftDownAt > 0 {
             // Shift 被释放 — 检查是否是短按切换
-            guard client() != nil else {
-                // FIME 不是当前活跃输入法，忽略
-                shiftDownAt = 0
-                shiftIsDown = false
-                return
-            }
             let elapsed = CACurrentMediaTime() - shiftDownAt
-            if elapsed >= 0.03 && elapsed <= 0.5 {
-                // 30ms ~ 500ms 内的快速按+放 → 模式切换
+
+            // 只在 FIME 是活跃输入法时响应
+            if client() != nil && elapsed >= 0.03 && elapsed <= 0.5 {
                 toggleMode()
                 log("shift toggle: \(Int(elapsed * 1000))ms")
             } else {
-                log("shift ignored: \(Int(elapsed * 1000))ms (not a quick tap)")
+                log("shift release: \(Int(elapsed * 1000))ms ignored (client=\(client() != nil))")
             }
             shiftDownAt = 0
         }
@@ -204,7 +236,7 @@ final class FIMEController: IMKInputController {
     /// 1. 根据当前模式分派到 `handleRawMode` 或 `handleFuzzyMode`
     ///
     /// 注意：modifier 键事件（Shift 等）不会到达此方法，
-    /// 它们在 `setupFlagsMonitor` 中单独处理。
+    /// 它们在 `setupEventTap()` 的 CGEvent tap 回调中单独处理。
     ///
     /// - Parameters:
     ///   - event: 键盘事件
